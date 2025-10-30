@@ -261,6 +261,7 @@ def _init_history_table(conn: Optional[pymysql.connections.Connection]) -> None:
 def save_history_entry(topic: str, article_md: str, image_urls: List[str], search_text: str, model: str) -> None:
     conn = _ensure_conn(_get_db_connection())
     if conn is None:
+        st.session_state["db_error"] = "数据库连接不可用，未保存历史。"
         return
     try:
         with conn.cursor() as cur:
@@ -271,14 +272,20 @@ def save_history_entry(topic: str, article_md: str, image_urls: List[str], searc
                 """,
                 (topic, article_md, json.dumps(image_urls, ensure_ascii=False), search_text, model),
             )
+        st.session_state.pop("db_error", None)
     except Exception:
-        # Silently ignore to avoid breaking UI flow
-        pass
+        # Record error but avoid breaking UI flow
+        try:
+            import traceback as _tb
+            st.session_state["db_error"] = _tb.format_exc()[-500:]
+        except Exception:
+            st.session_state["db_error"] = "保存历史失败（未知错误）。"
 
 
 def fetch_history_entries(limit: int = 50) -> List[Dict[str, Any]]:
     conn = _ensure_conn(_get_db_connection())
     if conn is None:
+        st.session_state["db_error"] = "数据库连接不可用，无法读取历史。"
         return []
     try:
         with conn.cursor() as cur:
@@ -293,8 +300,14 @@ def fetch_history_entries(limit: int = 50) -> List[Dict[str, Any]]:
                     r["image_urls"] = json.loads(r.get("image_urls") or "[]")
                 except Exception:
                     r["image_urls"] = []
+            st.session_state.pop("db_error", None)
             return rows
     except Exception:
+        try:
+            import traceback as _tb
+            st.session_state["db_error"] = _tb.format_exc()[-500:]
+        except Exception:
+            st.session_state["db_error"] = "读取历史失败（未知错误）。"
         return []
 
 
@@ -322,17 +335,43 @@ def main() -> None:
     with st.sidebar:
         # 历史记录优先显示在最上方
         st.markdown("**历史记录**")
+        # 如果刚保存了历史，自动刷新页面以显示最新记录
+        if st.session_state.pop("history_refresh_needed", False):
+            try:
+                st.rerun()
+            except Exception:
+                pass
         with st.expander("浏览历史记录", expanded=False):
+            err = st.session_state.get("db_error")
+            if err:
+                st.warning(f"数据库状态：{err}")
+            if st.button("刷新历史"):
+                try:
+                    st.rerun()
+                except Exception:
+                    pass
             entries = fetch_history_entries(limit=50)
             if entries:
                 labels = [f"{e['id']} · {str(e['created_at'])[:19]} · {e['topic']}" for e in entries]
-                idx = st.selectbox("选择一条记录", list(range(len(entries))), format_func=lambda i: labels[i])
+                # 记录上一次选择的索引
+                prev_idx = st.session_state.get("history_selected_idx_last")
+                idx = st.selectbox(
+                    "选择一条记录",
+                    list(range(len(entries))),
+                    format_func=lambda i: labels[i],
+                    key="history_selected_idx",
+                )
                 selected_entry = entries[idx]
-                col_a, col_b, col_c = st.columns(3)
-                with col_a:
-                    if st.button("查看该记录", key=f"view_{selected_entry['id']}"):
+                # 仅在选择发生变化或未有预览时，才自动预览；
+                # 若刚执行清除预览，则跳过一次自动预览
+                clear_block = st.session_state.pop("history_clear_block", False)
+                if not clear_block:
+                    if (prev_idx is None) or (prev_idx != idx) or (not st.session_state.get("view_article_md")):
                         st.session_state["view_article_md"] = selected_entry["article_md"]
                         st.session_state["view_article_topic"] = selected_entry["topic"]
+                st.session_state["history_selected_idx_last"] = idx
+
+                col_b, col_c = st.columns(2)
                 with col_b:
                     if st.button("删除该记录", key=f"del_{selected_entry['id']}"):
                         delete_history_entry(int(selected_entry["id"]))
@@ -345,6 +384,12 @@ def main() -> None:
                     if st.session_state.get("view_article_md") and st.button("清除预览", key="clear_preview_side"):
                         st.session_state.pop("view_article_md", None)
                         st.session_state.pop("view_article_topic", None)
+                        # 阻止下一次渲染时自动预览恢复
+                        st.session_state["history_clear_block"] = True
+                        try:
+                            st.rerun()
+                        except Exception:
+                            pass
             else:
                 st.info("暂无历史记录。")
 
@@ -456,6 +501,9 @@ def main() -> None:
 
     # Step 1: Generate topics from search or manual input
     if enable_tavily_search and st.session_state.pop("btn_generate_topics", False):
+        # 清除历史预览，让主区域显示空白和新内容
+        st.session_state.pop("view_article_md", None)
+        st.session_state.pop("view_article_topic", None)
         if tavily_client is None:
             st.error("无法联网搜索，请正确安装并配置 tavily-python 与 TAVILY_API_KEY。")
         else:
@@ -510,6 +558,9 @@ def main() -> None:
 
     # Regenerate topics without re-searching (uses last search text)
     if enable_tavily_search and st.session_state.pop("btn_regen_topics", False):
+        # 清除历史预览，让主区域显示空白和新内容
+        st.session_state.pop("view_article_md", None)
+        st.session_state.pop("view_article_topic", None)
         last_search_text = st.session_state.get("last_search_text", "")
         if not last_search_text:
             st.error("暂无可用的搜索结果，请先点击『生成选题』进行联网检索。")
@@ -574,7 +625,9 @@ def main() -> None:
                         except Exception:
                             pass
 
-                    # Persist to history (best-effort)
+                    st.markdown(article_md)
+                    
+                    # Persist to history (best-effort) - 在文章显示后保存，避免打断显示
                     try:
                         save_history_entry(
                             topic=selected,
@@ -583,10 +636,10 @@ def main() -> None:
                             search_text=last_search_text,
                             model=model,
                         )
+                        # 保存成功后标记需要刷新历史记录（将在下一次渲染时触发）
+                        st.session_state["history_refresh_needed"] = True
                     except Exception:
                         pass
-
-                    st.markdown(article_md)
                     
                     # Add copyable markdown code block
                     st.markdown("---")
