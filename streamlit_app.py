@@ -1,9 +1,13 @@
 import os
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
+import json
+import configparser
 
 import streamlit as st
 from openai import OpenAI
 import requests
+import pymysql
+from pymysql.cursors import DictCursor
 
 try:
     # tavily-python SDK
@@ -177,11 +181,173 @@ def replace_placeholders_with_images(article_md: str, image_urls: List[str], ren
     return replaced
 
 
+@st.cache_resource(show_spinner=False)
+def _get_db_connection() -> Optional[pymysql.connections.Connection]:
+    """Create and cache a MySQL connection using config.ini.
+
+    Returns None if configuration is missing or connection fails.
+    """
+    try:
+        cfg = configparser.ConfigParser()
+        cfg.read(os.path.join("/home/zyhy", "plugins-center", "resource", "config.ini"))
+        if "mysql" not in cfg:
+            return None
+        section = cfg["mysql"]
+        host = section.get("host", "").strip()
+        port = section.getint("port", 3306)
+        user = section.get("username", "").strip()
+        password = section.get("password", "").strip()
+        database = section.get("database", "").strip()
+        if not (host and user and database):
+            return None
+        conn = pymysql.connect(
+            host=host,
+            port=port,
+            user=user,
+            password=password,
+            database=database,
+            charset="utf8mb4",
+            autocommit=True,
+            cursorclass=DictCursor,
+            connect_timeout=5,
+        )
+        try:
+            conn.ping(reconnect=True)
+        except Exception:
+            pass
+        return conn
+    except Exception:
+        return None
+
+
+def _ensure_conn(conn: Optional[pymysql.connections.Connection]) -> Optional[pymysql.connections.Connection]:
+    if conn is None:
+        return None
+    try:
+        conn.ping(reconnect=True)
+        return conn
+    except Exception:
+        try:
+            # Attempt to rebuild the cached resource by clearing and re-fetching
+            _get_db_connection.clear()  # type: ignore[attr-defined]
+            new_conn = _get_db_connection()
+            if new_conn is not None:
+                new_conn.ping(reconnect=True)
+            return new_conn
+        except Exception:
+            return None
+
+
+def _init_history_table(conn: Optional[pymysql.connections.Connection]) -> None:
+    conn = _ensure_conn(conn)
+    if conn is None:
+        return
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS gzh_history (
+              id BIGINT PRIMARY KEY AUTO_INCREMENT,
+              created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              topic VARCHAR(255) NOT NULL,
+              article_md MEDIUMTEXT NOT NULL,
+              image_urls JSON NULL,
+              search_text MEDIUMTEXT NULL,
+              model VARCHAR(128) NULL
+            ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+            """
+        )
+
+
+def save_history_entry(topic: str, article_md: str, image_urls: List[str], search_text: str, model: str) -> None:
+    conn = _ensure_conn(_get_db_connection())
+    if conn is None:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO gzh_history (topic, article_md, image_urls, search_text, model)
+                VALUES (%s, %s, %s, %s, %s)
+                """,
+                (topic, article_md, json.dumps(image_urls, ensure_ascii=False), search_text, model),
+            )
+    except Exception:
+        # Silently ignore to avoid breaking UI flow
+        pass
+
+
+def fetch_history_entries(limit: int = 50) -> List[Dict[str, Any]]:
+    conn = _ensure_conn(_get_db_connection())
+    if conn is None:
+        return []
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, created_at, topic, article_md, image_urls, model FROM gzh_history ORDER BY id DESC LIMIT %s",
+                (int(limit),),
+            )
+            rows = cur.fetchall() or []
+            # Ensure image_urls parsed to list where possible
+            for r in rows:
+                try:
+                    r["image_urls"] = json.loads(r.get("image_urls") or "[]")
+                except Exception:
+                    r["image_urls"] = []
+            return rows
+    except Exception:
+        return []
+
+
+def delete_history_entry(entry_id: int) -> None:
+    conn = _ensure_conn(_get_db_connection())
+    if conn is None:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM gzh_history WHERE id = %s", (int(entry_id),))
+    except Exception:
+        pass
+
+
 def main() -> None:
     st.set_page_config(page_title="公众号选题 + 图文生成（联网版）", page_icon="📰", layout="centered")
     st.title("公众号选题 + 图文生成（联网版）")
 
+    # Initialize DB (no-op if unavailable)
+    try:
+        _init_history_table(_get_db_connection())
+    except Exception:
+        pass
+
     with st.sidebar:
+        # 历史记录优先显示在最上方
+        st.markdown("**历史记录**")
+        with st.expander("浏览历史记录", expanded=False):
+            entries = fetch_history_entries(limit=50)
+            if entries:
+                labels = [f"{e['id']} · {str(e['created_at'])[:19]} · {e['topic']}" for e in entries]
+                idx = st.selectbox("选择一条记录", list(range(len(entries))), format_func=lambda i: labels[i])
+                selected_entry = entries[idx]
+                col_a, col_b, col_c = st.columns(3)
+                with col_a:
+                    if st.button("查看该记录", key=f"view_{selected_entry['id']}"):
+                        st.session_state["view_article_md"] = selected_entry["article_md"]
+                        st.session_state["view_article_topic"] = selected_entry["topic"]
+                with col_b:
+                    if st.button("删除该记录", key=f"del_{selected_entry['id']}"):
+                        delete_history_entry(int(selected_entry["id"]))
+                        st.success("已删除。")
+                        try:
+                            st.rerun()
+                        except Exception:
+                            pass
+                with col_c:
+                    if st.session_state.get("view_article_md") and st.button("清除预览", key="clear_preview_side"):
+                        st.session_state.pop("view_article_md", None)
+                        st.session_state.pop("view_article_topic", None)
+            else:
+                st.info("暂无历史记录。")
+
         st.markdown("**配置**")
         # Safe secret access helper to avoid StreamlitSecretNotFoundError when secrets.toml is missing
         def get_secret_value(key: str) -> str:
@@ -204,6 +370,13 @@ def main() -> None:
                 value="当前热点话题、行业趋势、用户关注问题",
                 help="会用于 Tavily 联网搜索，可自行改写以贴近你的行业/受众",
             )
+            btn_col1, btn_col2 = st.columns(2)
+            with btn_col1:
+                if st.button("生成选题"):
+                    st.session_state["btn_generate_topics"] = True
+            with btn_col2:
+                if st.button("重新生成选题"):
+                    st.session_state["btn_regen_topics"] = True
         
         st.markdown("**密钥（可直接填写）**")
         input_openrouter = st.text_input("OpenRouter API Key", type="password", value="")
@@ -232,6 +405,20 @@ def main() -> None:
             strong_filter_display = False
             show_image_links_section = False
             preview_images_before_article = False
+
+        # 历史记录已在顶部显示
+
+    # If user is previewing a history record, render it before any model/client initialization
+    if st.session_state.get("view_article_md"):
+        topic_preview = st.session_state.get("view_article_topic", "历史记录预览")
+        st.markdown(f"### {topic_preview}")
+        article_preview = str(st.session_state.get("view_article_md") or "")
+        st.markdown(article_preview)
+        st.markdown("---")
+        with st.expander("复制该历史 Markdown（纯文本）", expanded=False):
+            st.text_area("复制下面内容：", value=article_preview, height=300, label_visibility="collapsed")
+            st.download_button("下载为 article.md", data=article_preview, file_name="article.md", mime="text/markdown")
+        # 清除预览按钮已移动到侧栏历史记录区
 
     # Read reference file if uploaded
     reference_content = ""
@@ -268,7 +455,7 @@ def main() -> None:
             tavily_client = None
 
     # Step 1: Generate topics from search or manual input
-    if enable_tavily_search and st.button("生成选题"):
+    if enable_tavily_search and st.session_state.pop("btn_generate_topics", False):
         if tavily_client is None:
             st.error("无法联网搜索，请正确安装并配置 tavily-python 与 TAVILY_API_KEY。")
         else:
@@ -322,7 +509,7 @@ def main() -> None:
                 st.warning("请至少输入一个主题。")
 
     # Regenerate topics without re-searching (uses last search text)
-    if enable_tavily_search and st.button("重新生成选题"):
+    if enable_tavily_search and st.session_state.pop("btn_regen_topics", False):
         last_search_text = st.session_state.get("last_search_text", "")
         if not last_search_text:
             st.error("暂无可用的搜索结果，请先点击『生成选题』进行联网检索。")
@@ -386,6 +573,18 @@ def main() -> None:
                             st.image(image_urls, caption=captions, use_container_width=True)
                         except Exception:
                             pass
+
+                    # Persist to history (best-effort)
+                    try:
+                        save_history_entry(
+                            topic=selected,
+                            article_md=article_md,
+                            image_urls=image_urls,
+                            search_text=last_search_text,
+                            model=model,
+                        )
+                    except Exception:
+                        pass
 
                     st.markdown(article_md)
                     
