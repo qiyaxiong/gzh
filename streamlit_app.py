@@ -14,6 +14,16 @@ try:
     from tavily import TavilyClient
 except Exception:  # pragma: no cover - optional import error surfaced in UI
     TavilyClient = None  # type: ignore
+# 可直接在此处内嵌 MySQL 连接信息（作为最后兜底）。
+# 部署时优先顺序：环境变量 > config.ini > 这里的常量。
+DEFAULT_MYSQL_CONFIG = {
+    "host": os.environ.get("MYSQL_HOST", "rm-bp1kt46aa4w7ad3u7ho.mysql.rds.aliyuncs.com"),
+    "port": int(os.environ.get("MYSQL_PORT", "3306")),
+    "username": os.environ.get("MYSQL_USERNAME", "root"),
+    "password": os.environ.get("MYSQL_PASSWORD", "qi@123456"),
+    "database": os.environ.get("MYSQL_DATABASE", "gzh"),
+}
+
 
 
 def get_llm_client(api_key: str) -> OpenAI:
@@ -188,18 +198,45 @@ def _get_db_connection() -> Optional[pymysql.connections.Connection]:
     Returns None if configuration is missing or connection fails.
     """
     try:
-        cfg = configparser.ConfigParser()
-        cfg.read(os.path.join("/home/zyhy", "plugins-center", "resource", "config.ini"))
-        if "mysql" not in cfg:
-            return None
-        section = cfg["mysql"]
-        host = section.get("host", "").strip()
-        port = section.getint("port", 3306)
-        user = section.get("username", "").strip()
-        password = section.get("password", "").strip()
-        database = section.get("database", "").strip()
+        # 1) 环境变量
+        env_host = os.environ.get("MYSQL_HOST", "").strip()
+        env_user = os.environ.get("MYSQL_USERNAME", "").strip()
+        env_pwd = os.environ.get("MYSQL_PASSWORD", "").strip()
+        env_db = os.environ.get("MYSQL_DATABASE", "").strip()
+        env_port = int(os.environ.get("MYSQL_PORT", "0") or 0)
+
+        host = env_host
+        user = env_user
+        password = env_pwd
+        database = env_db
+        port = env_port if env_port > 0 else 0
+
+        # 2) config.ini（若环境变量未提供）
+        if not (host and user and database):
+            cfg = configparser.ConfigParser()
+            cfg.read(os.path.join("/home/zyhy", "plugins-center", "resource", "config.ini"))
+            if "mysql" in cfg:
+                section = cfg["mysql"]
+                host = host or section.get("host", "").strip()
+                user = user or section.get("username", "").strip()
+                password = password or section.get("password", "").strip()
+                database = database or section.get("database", "").strip()
+                if port <= 0:
+                    port = section.getint("port", fallback=0)
+
+        # 3) 代码内嵌兜底
+        if not (host and user and database):
+            host = DEFAULT_MYSQL_CONFIG["host"]
+            user = DEFAULT_MYSQL_CONFIG["username"]
+            password = DEFAULT_MYSQL_CONFIG["password"]
+            database = DEFAULT_MYSQL_CONFIG["database"]
+            if port <= 0:
+                port = DEFAULT_MYSQL_CONFIG["port"]
+
         if not (host and user and database):
             return None
+        if port <= 0:
+            port = 3306
         conn = pymysql.connect(
             host=host,
             port=port,
