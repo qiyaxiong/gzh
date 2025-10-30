@@ -1,7 +1,6 @@
 import os
 from typing import List, Dict, Any, Optional
 import json
-import configparser
 
 import streamlit as st
 from openai import OpenAI
@@ -21,7 +20,7 @@ DEFAULT_MYSQL_CONFIG = {
     "port": int(os.environ.get("MYSQL_PORT", "3306")),
     "username": os.environ.get("MYSQL_USERNAME", "root"),
     "password": os.environ.get("MYSQL_PASSWORD", "qi@123456"),
-    "database": os.environ.get("MYSQL_DATABASE", "gzh"),
+    "database": os.environ.get("MYSQL_DATABASE", "dify_db"),
 }
 
 
@@ -198,45 +197,14 @@ def _get_db_connection() -> Optional[pymysql.connections.Connection]:
     Returns None if configuration is missing or connection fails.
     """
     try:
-        # 1) 环境变量
-        env_host = os.environ.get("MYSQL_HOST", "").strip()
-        env_user = os.environ.get("MYSQL_USERNAME", "").strip()
-        env_pwd = os.environ.get("MYSQL_PASSWORD", "").strip()
-        env_db = os.environ.get("MYSQL_DATABASE", "").strip()
-        env_port = int(os.environ.get("MYSQL_PORT", "0") or 0)
-
-        host = env_host
-        user = env_user
-        password = env_pwd
-        database = env_db
-        port = env_port if env_port > 0 else 0
-
-        # 2) config.ini（若环境变量未提供）
-        if not (host and user and database):
-            cfg = configparser.ConfigParser()
-            cfg.read(os.path.join("/home/zyhy", "plugins-center", "resource", "config.ini"))
-            if "mysql" in cfg:
-                section = cfg["mysql"]
-                host = host or section.get("host", "").strip()
-                user = user or section.get("username", "").strip()
-                password = password or section.get("password", "").strip()
-                database = database or section.get("database", "").strip()
-                if port <= 0:
-                    port = section.getint("port", fallback=0)
-
-        # 3) 代码内嵌兜底
-        if not (host and user and database):
-            host = DEFAULT_MYSQL_CONFIG["host"]
-            user = DEFAULT_MYSQL_CONFIG["username"]
-            password = DEFAULT_MYSQL_CONFIG["password"]
-            database = DEFAULT_MYSQL_CONFIG["database"]
-            if port <= 0:
-                port = DEFAULT_MYSQL_CONFIG["port"]
-
+        # 仅使用内嵌配置
+        host = DEFAULT_MYSQL_CONFIG["host"]
+        user = DEFAULT_MYSQL_CONFIG["username"]
+        password = DEFAULT_MYSQL_CONFIG["password"]
+        database = DEFAULT_MYSQL_CONFIG["database"]
+        port = int(DEFAULT_MYSQL_CONFIG.get("port", 3306))
         if not (host and user and database):
             return None
-        if port <= 0:
-            port = 3306
         conn = pymysql.connect(
             host=host,
             port=port,
@@ -359,6 +327,26 @@ def delete_history_entry(entry_id: int) -> None:
         pass
 
 
+def get_history_table_summary() -> str:
+    conn = _ensure_conn(_get_db_connection())
+    if conn is None:
+        return "数据库连接不可用"
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT DATABASE() AS db")
+            row = cur.fetchone() or {}
+            dbname = row.get("db") or "(未知)"
+            try:
+                cur.execute("SELECT COUNT(*) AS cnt FROM gzh_history")
+                cnt_row = cur.fetchone() or {"cnt": 0}
+                cnt = int(cnt_row.get("cnt") or 0)
+                return f"当前库: {dbname} · 表 gzh_history 行数: {cnt}"
+            except Exception:
+                return f"当前库: {dbname} · 表 gzh_history 不存在"
+    except Exception:
+        return "无法查询数据库信息"
+
+
 def main() -> None:
     st.set_page_config(page_title="公众号选题 + 图文生成（联网版）", page_icon="📰", layout="centered")
     st.title("公众号选题 + 图文生成（联网版）")
@@ -382,6 +370,7 @@ def main() -> None:
             err = st.session_state.get("db_error")
             if err:
                 st.warning(f"数据库状态：{err}")
+            st.caption(get_history_table_summary())
             if st.button("刷新历史"):
                 try:
                     st.rerun()
